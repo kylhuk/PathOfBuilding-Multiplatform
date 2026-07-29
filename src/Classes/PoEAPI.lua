@@ -86,7 +86,7 @@ function PoEAPIClass:UpdateMain()
 end
 
 --- @param callback fun(errCode: string?)
-function PoEAPIClass:FetchAuthToken(callback)
+function PoEAPIClass:FetchAuthToken(callback, timeout)
 	math.randomseed(os.time())
 	local secret = math.random(2 ^ 32 - 1)
 	local code_verifier = base64_encode(tostring(secret))
@@ -105,16 +105,20 @@ function PoEAPIClass:FetchAuthToken(callback)
 	)
 
 	local server = io.open("LaunchServer.lua", "r")
-	local id = LaunchSubScript(server:read("*a"), "", "ConPrintf,OpenURL", authUrl)
+	local id = LaunchSubScript(server:read("*a"), "", "ConPrintf,OpenURL,Copy", authUrl, timeout or 60)
 	server:close()
 	if id then
 		launch.subScripts[id] = {
 			type = "DOWNLOAD",
-			callback = function(code, errMsg, state, port)
+			callback = function(code, errMsg, state, port, callbackUrl)
 				if not code then
-					ConPrintf("Failed to get code from server: %s", errMsg)
+					ConPrintf("Failed to get code from server: %s", errMsg or self.ERROR_NO_AUTH)
 					self:ResetDetails()
-					callback(errMsg or self.ERROR_NO_AUTH)
+					local detail = errMsg or self.ERROR_NO_AUTH
+					if callbackUrl then
+						detail = detail .. "\nAuthorization URL (copied to clipboard):\n" .. callbackUrl
+					end
+					callback(detail)
 					return
 				end
 
