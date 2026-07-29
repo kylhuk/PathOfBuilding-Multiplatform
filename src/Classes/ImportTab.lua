@@ -159,6 +159,7 @@ local function addOAuthControls(self)
 
 	self.controls.authenticateButton = new("ButtonControl", { "TOPLEFT", self.controls.characterImportAnchor, "TOPLEFT" },
 		{ 0, 0, 200, 16 }, "^7Authorize with Path of Exile", function()
+			self.oauthTimer = os.time()
 			main.api:FetchAuthToken(function(errCode)
 				if errCode then
 					self.oauthErrCode = errCode
@@ -172,7 +173,6 @@ local function addOAuthControls(self)
 					fetchCharacters()
 				end
 			end, oauthTimeout)
-			self.oauthTimer = os.time()
 		end)
 	self.controls.authenticateButton.shown = function()
 		return self.usingOauth and not self.isAuthorized()
