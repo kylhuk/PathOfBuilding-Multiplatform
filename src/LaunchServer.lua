@@ -1,5 +1,6 @@
 -- Start a server
-local url = ...
+local url, timeout = ...
+timeout = tonumber(timeout) or 60
 local luaSocket = require("socket")
 local server = luaSocket.tcp4()
 local function bindSocket()
@@ -17,7 +18,10 @@ local function bindSocket()
 	end
 	return nil, err
 end
-assert(bindSocket())
+local bindResult, bindErr = bindSocket()
+if not bindResult then
+	return nil, "Unable to start local OAuth callback server: " .. tostring(bindErr)
+end
 local host, port = server:getsockname()
 ConPrintf("Server started on %s:%s", host, port)
 
@@ -107,8 +111,12 @@ local commonResponseEnd = [[
 </html>
 ]]
 
-ConPrintf("Opening URL: %s", url)
-OpenURL(url)
+ConPrintf("Authorization URL (copied to clipboard): %s", url)
+Copy(url)
+local openErr = OpenURL(url)
+if openErr then
+	ConPrintf("Automatic browser launch failed: %s", openErr)
+end
 
 --- Handle an incoming socket connection, to complete an OAuth redirect.
 --- @param client table @The socket connection to handle, as returned by `server:accept()`.
@@ -133,17 +141,24 @@ function handleConnection(client, attempt)
 			ConPrintf(
 				"Attempt %d to handle incoming connection received an invalid HTTP request: non-GET method %s",
 				attempt,
-				method
+				method or "unknown"
 			)
 
 			return true
 		end
 
 		local queryParams = {}
-		for k, v in path:gmatch("([^&=?]+)=([^&=?]+)") do
-			queryParams[k] = v:gsub("%%(%x%x)", function(hex)
-				return string.char(tonumber(hex, 16))
-			end)
+		local query = path and path:match("%?(.*)$")
+		if query then
+			for pair in query:gmatch("[^&]+") do
+				local k, v = pair:match("^([^=]+)=(.*)$")
+				if k and v then
+					v = v:gsub("%+", " "):gsub("%%(%x%x)", function(hex)
+						return string.char(tonumber(hex, 16))
+					end)
+					queryParams[k] = v
+				end
+			end
 		end
 
 		if queryParams["code"] ~= nil then
@@ -153,12 +168,15 @@ function handleConnection(client, attempt)
 			]] .. commonResponseEnd
 			code = queryParams["code"]
 			state = queryParams["state"]
-		else
+		elseif queryParams["error"] ~= nil then
 			response = commonResponse .. [[
 			<h1>PoB - Authentication Failed</h1>
 			<p>❌ Authentication failed. Please try again.</p>
-			<code>]] .. queryParams["error"] .. ": " .. queryParams["error_description"] .. [[</code>
+			<code>]] .. queryParams["error"] .. ": " .. (queryParams["error_description"] or "") .. [[</code>
 			]] .. commonResponseEnd
+		else
+			ConPrintf("Attempt %d to handle incoming connection received no OAuth parameters", attempt)
+			return true
 		end
 
 		shouldRetry = false
@@ -186,13 +204,13 @@ end
 --   5. PoB never receives the OAuth redirect, and doesn't have any of the information necessary to use the API
 --
 -- To avoid this, we instead allow for any number of incoming connections, and simply stop listening for them once
--- either a) 30 seconds have elapsed or b) we've received a legitimate HTTP request and responded to it.
+-- either a) the configured timeout has elapsed or b) we've received a legitimate HTTP request and responded to it.
 --
 -- Unfortunately, this still isn't perfect: in theory, two applications (such as a browser, and something else) could
 -- attempt to establish a connection at the same time. In the future, this could be refactored to perform non-blocking
 -- IO, so that it can operate concurrently, but hopefully that isn't necessary.
 local attempt = 1
-local stopAt = os.time() + 60
+local stopAt = os.time() + timeout
 local errMsg
 local shouldRetry, code, state = true, nil, nil
 while (os.time() < stopAt) and shouldRetry do
@@ -214,7 +232,7 @@ while (os.time() < stopAt) and shouldRetry do
 	attempt = attempt + 1
 end
 server:close()
-if os.time() >= stopAt then
-	errMsg = "Timeout reached without a response received by the local server"
+if shouldRetry and os.time() >= stopAt then
+	errMsg = string.format("Timeout reached after %d seconds without a response received by the local server", timeout)
 end
-return code, errMsg, state, port
+return code, errMsg, state, port, url
