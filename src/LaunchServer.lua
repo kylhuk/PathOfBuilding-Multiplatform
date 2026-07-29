@@ -192,23 +192,19 @@ function handleConnection(client, attempt)
 	return shouldRetry, code, state
 end
 
--- Misbehaving software (think VPNs, anything network-related, even OS services) will occasionally attempt to connect
--- to newly-opened sockets for one reason or another. Previously, PoB only waited for one connection, and gave up
--- immediately if something went wrong.
+-- Some software may connect to a newly opened local socket before the browser sends the OAuth callback.
+-- This can happen with VPNs, network tools, or other background services.
 --
--- This would result in a sequence of events roughly like this:
---   1. PoB opens a socket
---   2. A misbehaving piece of software connects to the socket, sends nothing, then terminates the connection
---   3. PoB tries to read from the socket, receives an error since the connection is terminated, and closes the server
---   4. OAuth authorization succeeds, but by the time the user is redirected back to PoB, the server is already closed
---   5. PoB never receives the OAuth redirect, and doesn't have any of the information necessary to use the API
+-- The callback server therefore:
+--   1. keeps listening until the configured timeout,
+--   2. ignores connections that do not contain OAuth parameters, and
+--   3. stops after it receives a valid OAuth response.
 --
--- To avoid this, we instead allow for any number of incoming connections, and simply stop listening for them once
--- either a) the configured timeout has elapsed or b) we've received a legitimate HTTP request and responded to it.
+-- The authorization URL is copied to the clipboard and opened automatically when possible.
+-- If the browser does not open, the user can paste the copied URL into any browser.
 --
--- Unfortunately, this still isn't perfect: in theory, two applications (such as a browser, and something else) could
--- attempt to establish a connection at the same time. In the future, this could be refactored to perform non-blocking
--- IO, so that it can operate concurrently, but hopefully that isn't necessary.
+-- Connections are handled one at a time. That is sufficient here because the server only
+-- needs to wait for one valid callback.
 local attempt = 1
 local stopAt = os.time() + timeout
 local errMsg
