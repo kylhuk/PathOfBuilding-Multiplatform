@@ -22,9 +22,10 @@ local realmList = {
 }
 
 local function addOAuthControls(self)
+	local oauthTimeout = 60
 	self.usingOauth = true
 	self.isAuthorized = function() return main.api.authToken ~= nil end
-	-- the 30 second timer for oauth
+	-- the timeout timer for oauth
 	--- @type integer?
 	self.oauthTimer = nil
 	-- timestamp for when we can request again after being rate limited
@@ -44,12 +45,12 @@ local function addOAuthControls(self)
 		if not self.isAuthorized() and not self.oauthTimer then
 			return colorCodes.WARNING .. "Not authenticated"
 		elseif not self.isAuthorized() and self.oauthTimer then
-			local timeLeft = m_max(0, (self.oauthTimer + 30) - os.time())
+			local timeLeft = m_max(0, (self.oauthTimer + oauthTimeout) - os.time())
 			if timeLeft < 1 then
 				self.oauthTimer = nil
 				return colorCodes.WARNING .. "Not authenticated"
 			end
-			return string.format("Logging in... (%d)", timeLeft) .. (self.oauthErrCode or "")
+			return string.format("Logging in... (%d) - URL copied to clipboard", timeLeft) .. (self.oauthErrCode or "")
 			-- user is spam changing realms and is rate limited
 		elseif self.isAuthorized() and self.rateLimitEndTime then
 			local timeLeft = m_max(0, self.rateLimitEndTime - os.time())
@@ -170,7 +171,7 @@ local function addOAuthControls(self)
 					-- to that last realm
 					fetchCharacters()
 				end
-			end)
+			end, oauthTimeout)
 			self.oauthTimer = os.time()
 		end)
 	self.controls.authenticateButton.shown = function()
