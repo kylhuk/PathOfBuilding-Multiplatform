@@ -1,4 +1,4 @@
-<!-- cspell:words Flathub flathub FLATHUB kylhuk pathofbuilding -->
+<!-- cspell:words aarch64 Flathub flathub FLATHUB kylhuk pathofbuilding -->
 
 # Automated upstream releases
 
@@ -40,18 +40,22 @@ Actions secrets. Set the repository variable `HOMEBREW_TAP_REPOSITORY` to
 
 ## Flathub publication
 
-Flathub requires the initial submission PR to be authored and submitted
-manually; its rules explicitly prohibit AI-generated initial submissions.
-Submit `packaging/flatpak/community.pathofbuilding.PathOfBuilding.yml` yourself
-after replacing the local payload source with source-build inputs accepted by
-Flathub.
+The app already exists as
+`flathub/community.pathofbuilding.PathOfBuilding`. It currently builds the
+separate `rusty-path-of-building` runtime and publishes x86_64 only. Do not
+submit a duplicate application.
 
-After the app is accepted and Flathub creates
-`flathub/community.pathofbuilding.PathOfBuilding`, obtain a token belonging to
-an approved maintainer with Contents read/write access to only that repository.
-Store it as `FLATHUB_TOKEN` and set `FLATHUB_REPOSITORY` to the repository's
-full name. Automated maintenance updates can then update the manifest; the
-initial submission cannot be automated.
+Request maintainer access to the existing Flathub repository through the
+Flathub project. Once access is granted, its manifest must be migrated once
+from the Rust runtime to this SimpleGraphic runtime and extended to aarch64.
+The standalone manifest in this repository packages the already-built release
+payload; it is not the source-build manifest required for that migration.
+
+After migration, add `x-checker-data` to the accepted source entries. Flathub's
+External Data Checker then opens update PRs automatically. Flathub does not
+normally permit those PRs to auto-merge, so a secret alone cannot provide
+policy-compliant, unattended publication. A maintainer must merge the update
+PR unless Flathub grants the app an explicit auto-merge exception.
 
 ## Optional macOS signing and notarization
 

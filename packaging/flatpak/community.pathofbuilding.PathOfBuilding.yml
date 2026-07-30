@@ -20,8 +20,8 @@ modules:
       - ln -s /app/opt/pathofbuilding/pathofbuilding /app/bin/pathofbuilding
       - install -Dm644 pathofbuilding.desktop /app/share/applications/community.pathofbuilding.PathOfBuilding.desktop
     sources:
-      # The release workflow replaces this local source with immutable release
-      # archives and SHA-256 values when publishing to the Flathub app repo.
+      # This local source produces the standalone release bundle. The existing
+      # Flathub app repository requires a separate source-build manifest.
       - type: dir
         path: payload
       - type: file
