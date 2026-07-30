@@ -1,3 +1,4 @@
+# cspell:words Flathub pathofbuilding
 app-id: community.pathofbuilding.PathOfBuilding
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'

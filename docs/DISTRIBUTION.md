@@ -1,3 +1,5 @@
+<!-- cspell:words Flathub flathub FLATHUB kylhuk pathofbuilding -->
+
 # Automated upstream releases
 
 The scheduled synchronization workflow checks the upstream Path of Building

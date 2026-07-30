@@ -1,3 +1,4 @@
+# cspell:words pathofbuilding
 class PathOfBuilding < Formula
   desc "Offline build planner for Path of Exile"
   homepage "https://github.com/kylhuk/PathOfBuilding"

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# cspell:words Flathub
 """Render Homebrew and Flathub metadata from immutable release assets."""
 
 from __future__ import annotations

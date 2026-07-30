@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# cspell:words CDPATH pathofbuilding
 """Combine an upstream Path of Building checkout with a staged SimpleGraphic runtime."""
 
 from __future__ import annotations
