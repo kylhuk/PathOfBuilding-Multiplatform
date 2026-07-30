@@ -5,6 +5,9 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+# These permissions are used only by the fallback GITHUB_TOKEN. Git pushes and
+# gh commands below deliberately use GH_PUSH_TOKEN, which must be a classic PAT
+# with repo and workflow scopes (or an equivalent GitHub App token).
 permissions:
   actions: write
   contents: write
@@ -15,17 +18,34 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  TARGET_REPOSITORY: kylhuk/PathOfBuilding
   UPSTREAM_REPOSITORY: PathOfBuildingCommunity/PathOfBuilding
+  RELEASE_WORKFLOW: release-multiplatform.yml
 
 jobs:
   synchronize:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     steps:
+      - name: Verify push token is configured
+        env:
+          GH_PUSH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_PUSH_TOKEN" ]; then
+            echo 'GH_PUSH_TOKEN is not configured. Create a classic PAT with repo and workflow scopes and save it as a repository secret.' >&2
+            exit 1
+          fi
+
       - name: Check out the synchronization branch
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ env.TARGET_REPOSITORY }}
+          ref: dev
           fetch-depth: 0
+          # This token is also persisted as the origin credential used by git.
+          # GITHUB_TOKEN cannot push commits which create/update workflow files.
           token: ${{ secrets.GH_PUSH_TOKEN }}
+          persist-credentials: true
 
       - name: Fetch and mirror upstream refs
         id: sync
@@ -33,32 +53,49 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --prune --tags upstream dev master
 
+          # Keep the upstream tracking branches and tags available locally.
+          # GH_PUSH_TOKEN must have permission to push workflow-containing refs.
           git push --force origin \
             refs/remotes/upstream/dev:refs/heads/upstream/dev \
             refs/remotes/upstream/master:refs/heads/upstream/master
           git push origin --tags
 
           if ! git merge --no-edit upstream/dev; then
-            git merge --abort
-            issue_title="Upstream synchronization conflict"
+            git merge --abort || true
+            issue_title='Upstream synchronization conflict'
             issue_body="The scheduled merge of \`${UPSTREAM_REPOSITORY}:dev\` into \`dev\` conflicted. Run: \`git fetch upstream && git merge upstream/dev\` and resolve the conflict."
-            if ! gh issue list --state open --search "$issue_title in:title" --json title --jq '.[].title' | grep -Fxq "$issue_title"; then
-              gh issue create --title "$issue_title" --body "$issue_body"
+
+            if ! gh issue list \
+              --repo "$TARGET_REPOSITORY" \
+              --state open \
+              --search "$issue_title in:title" \
+              --json title \
+              --jq '.[].title' | grep -Fxq "$issue_title"; then
+              gh issue create \
+                --repo "$TARGET_REPOSITORY" \
+                --title "$issue_title" \
+                --body "$issue_body"
             fi
             exit 1
           fi
+
           git push origin HEAD:dev
 
-          latest_tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          latest_tag="$(
+            gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" \
+              --jq '.tag_name // empty'
+          )"
           if [ -z "$latest_tag" ]; then
-            echo "The upstream latest release has no tag." >&2
+            echo 'The upstream latest release has no tag.' >&2
             exit 1
           fi
+
           echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch a missing multi-platform release
@@ -67,19 +104,30 @@ jobs:
           LATEST_TAG: ${{ steps.sync.outputs.latest_tag }}
         run: |
           set -euo pipefail
-          if gh release view "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+          if gh release view "$LATEST_TAG" \
+            --repo "$TARGET_REPOSITORY" >/dev/null 2>&1; then
             echo "$LATEST_TAG is already published."
             exit 0
           fi
 
           running="$(
             gh run list \
-              --workflow release-multiplatform.yml \
-              --json status,displayTitle \
-              --jq "[.[] | select(.status != \"completed\" and (.displayTitle | contains(\"$LATEST_TAG\")))] | length"
+              --repo "$TARGET_REPOSITORY" \
+              --workflow "$RELEASE_WORKFLOW" \
+              --limit 100 \
+              --json status,displayTitle |
+              jq --arg tag "$LATEST_TAG" \
+                '[.[] | select(.status != "completed" and (.displayTitle | contains($tag)))] | length'
           )"
-          if [ "$running" != "0" ]; then
+          if [ "$running" != '0' ]; then
             echo "A release run for $LATEST_TAG is already active."
             exit 0
           fi
-          gh workflow run release-multiplatform.yml --ref dev -f "upstream_tag=$LATEST_TAG"
+
+          # The workflow file must exist on the repository default branch.
+          # --ref selects the dev source revision that the release should build.
+          gh workflow run "$RELEASE_WORKFLOW" \
+            --repo "$TARGET_REPOSITORY" \
+            --ref dev \
+            --field "upstream_tag=$LATEST_TAG"
