@@ -189,7 +189,7 @@ local stopAt = os.time() + 60
 local errMsg
 local shouldRetry, code, state = true, nil, nil
 while (os.time() < stopAt) and shouldRetry do
-	-- `settimeout`` applies only to individual operations, but we're more concerned with not spending more than 30
+	-- `settimeout` applies only to individual operations, but we're more concerned with not spending more than 60
 	-- seconds *total* waiting, so we adjust with each iteration as necessary.
 	local remainingTime = math.max(0, stopAt - os.time())
 	server:settimeout(remainingTime)
