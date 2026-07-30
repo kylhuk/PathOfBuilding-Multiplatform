@@ -1,0 +1,27 @@
+app-id: community.pathofbuilding.PathOfBuilding
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: pathofbuilding
+finish-args:
+  - --device=dri
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --filesystem=xdg-documents:rw
+modules:
+  - name: path-of-building
+    buildsystem: simple
+    build-commands:
+      - install -d /app/opt/pathofbuilding /app/bin /app/share/applications
+      - cp -a . /app/opt/pathofbuilding/
+      - ln -s /app/opt/pathofbuilding/pathofbuilding /app/bin/pathofbuilding
+      - install -Dm644 pathofbuilding.desktop /app/share/applications/community.pathofbuilding.PathOfBuilding.desktop
+    sources:
+      # The release workflow replaces this local source with immutable release
+      # archives and SHA-256 values when publishing to the Flathub app repo.
+      - type: dir
+        path: payload
+      - type: file
+        path: ../linux/pathofbuilding.desktop

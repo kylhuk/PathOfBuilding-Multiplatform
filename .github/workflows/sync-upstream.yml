@@ -1,0 +1,85 @@
+name: Synchronize upstream releases
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-synchronization
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: PathOfBuildingCommunity/PathOfBuilding
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the synchronization branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Fetch and mirror upstream refs
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --prune --tags upstream dev master
+
+          git push --force origin \
+            refs/remotes/upstream/dev:refs/heads/upstream/dev \
+            refs/remotes/upstream/master:refs/heads/upstream/master
+          git push origin --tags
+
+          if ! git merge --no-edit upstream/dev; then
+            git merge --abort
+            issue_title="Upstream synchronization conflict"
+            issue_body="The scheduled merge of \`${UPSTREAM_REPOSITORY}:dev\` into \`dev\` conflicted. Run: \`git fetch upstream && git merge upstream/dev\` and resolve the conflict."
+            if ! gh issue list --state open --search "$issue_title in:title" --json title --jq '.[].title' | grep -Fxq "$issue_title"; then
+              gh issue create --title "$issue_title" --body "$issue_body"
+            fi
+            exit 1
+          fi
+          git push origin HEAD:dev
+
+          latest_tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          if [ -z "$latest_tag" ]; then
+            echo "The upstream latest release has no tag." >&2
+            exit 1
+          fi
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch a missing multi-platform release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_TAG: ${{ steps.sync.outputs.latest_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$LATEST_TAG is already published."
+            exit 0
+          fi
+
+          running="$(
+            gh run list \
+              --workflow release-multiplatform.yml \
+              --json status,displayTitle \
+              --jq "[.[] | select(.status != \"completed\" and (.displayTitle | contains(\"$LATEST_TAG\")))] | length"
+          )"
+          if [ "$running" != "0" ]; then
+            echo "A release run for $LATEST_TAG is already active."
+            exit 0
+          fi
+          gh workflow run release-multiplatform.yml --ref dev -f "upstream_tag=$LATEST_TAG"

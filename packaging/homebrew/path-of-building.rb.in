@@ -1,0 +1,42 @@
+class PathOfBuilding < Formula
+  desc "Offline build planner for Path of Exile"
+  homepage "https://github.com/kylhuk/PathOfBuilding"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "@MACOS_ARM64_URL@"
+      sha256 "@MACOS_ARM64_SHA256@"
+    else
+      url "@MACOS_X64_URL@"
+      sha256 "@MACOS_X64_SHA256@"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "@LINUX_ARM64_URL@"
+      sha256 "@LINUX_ARM64_SHA256@"
+    else
+      url "@LINUX_X64_URL@"
+      sha256 "@LINUX_X64_SHA256@"
+    end
+  end
+
+  def install
+    libexec.install Dir["*"]
+    if OS.mac?
+      (bin/"pathofbuilding").write <<~EOS
+        #!/bin/bash
+        exec "#{libexec}/Path of Building.app/Contents/MacOS/Path of Building" "$@"
+      EOS
+    else
+      bin.install_symlink libexec/"pathofbuilding"
+    end
+  end
+
+  test do
+    assert_predicate bin/"pathofbuilding", :exist?
+  end
+end
