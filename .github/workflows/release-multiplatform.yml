@@ -1,0 +1,622 @@
+name: Build upstream multi-platform release
+run-name: Build ${{ inputs.upstream_tag }} for all platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Exact stable tag published by PathOfBuildingCommunity/PathOfBuilding
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.upstream_tag }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: PathOfBuildingCommunity/PathOfBuilding
+  ENGINE_REPOSITORY: kylhuk/PathOfBuilding-SimpleGraphic
+  ENGINE_REF: codex/multiplatform-runtime
+  VCPKG_DISABLE_METRICS: '1'
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      engine_sha: ${{ steps.metadata.outputs.engine_sha }}
+      release_name: ${{ steps.metadata.outputs.release_name }}
+      version: ${{ steps.metadata.outputs.version }}
+      should_release: ${{ steps.metadata.outputs.should_release }}
+    steps:
+      - name: Validate upstream release and resolve immutable inputs
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          release="$(
+            gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${TAG}" \
+              --jq 'select(.draft == false and .prerelease == false)'
+          )"
+          if [ -z "$release" ]; then
+            echo "$TAG is not an upstream stable release." >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="${TAG#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Unsupported upstream version: $TAG" >&2
+            exit 1
+          fi
+          engine_sha="$(
+            git ls-remote "https://github.com/${ENGINE_REPOSITORY}.git" "refs/heads/${ENGINE_REF}" |
+              awk 'NR == 1 {print $1}'
+          )"
+          if ! [[ "$engine_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve ${ENGINE_REPOSITORY}@${ENGINE_REF}." >&2
+            exit 1
+          fi
+          release_name="$(printf '%s' "$release" | jq -r '.name // .tag_name')"
+          {
+            echo "engine_sha=$engine_sha"
+            echo "release_name=$release_name"
+            echo "version=$version"
+            echo "should_release=true"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    if: needs.metadata.outputs.should_release == 'true'
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x86
+            cmake_arch: Win32
+            triplet: x86-windows
+          - id: windows-x64
+            cmake_arch: x64
+            triplet: x64-windows
+          - id: windows-arm64
+            cmake_arch: ARM64
+            triplet: arm64-windows
+    runs-on: ${{ matrix.id == 'windows-arm64' && 'windows-11-arm' || 'windows-2022' }}
+    steps:
+      - name: Check out distribution automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: distribution
+      - name: Check out exact upstream release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ inputs.upstream_tag }}
+          path: pob
+      - name: Check out immutable SimpleGraphic runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ needs.metadata.outputs.engine_sha }}
+          path: engine
+          submodules: recursive
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v5.0.3
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ matrix.id }}-${{ needs.metadata.outputs.engine_sha }}
+      - name: Build runtime and application
+        shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\engine\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          cmake -S engine -B "build\${{ matrix.id }}" -G "Visual Studio 17 2022" -A "${{ matrix.cmake_arch }}" `
+            "-DCMAKE_INSTALL_PREFIX=${{ github.workspace }}\stage\${{ matrix.id }}" `
+            "-DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}" `
+            "-DVCPKG_OVERLAY_TRIPLETS=${{ github.workspace }}\engine\vcpkg-triplets" `
+            -DSIMPLEGRAPHIC_BUILD_TESTS=ON
+          cmake --build "build\${{ matrix.id }}" --config Release --parallel
+          ctest --test-dir "build\${{ matrix.id }}" -C Release --output-on-failure
+          cmake --install "build\${{ matrix.id }}" --config Release
+          python engine\scripts\ci\verify_runtime.py --runtime "stage\${{ matrix.id }}" --platform windows
+          python distribution\packaging\assemble.py --runtime "stage\${{ matrix.id }}" --source pob --output "package\${{ matrix.id }}" --platform windows
+
+          cmake -S distribution\packaging\windows -B "launcher-build\${{ matrix.id }}" `
+            -G "Visual Studio 17 2022" -A "${{ matrix.cmake_arch }}"
+          cmake --build "launcher-build\${{ matrix.id }}" --config Release --parallel
+          Copy-Item "launcher-build\${{ matrix.id }}\Release\Path of Building.exe" `
+            "package\${{ matrix.id }}\Path of Building.exe"
+          Compress-Archive -Path "package\${{ matrix.id }}\*" `
+            -DestinationPath "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.zip"
+
+      - name: Create Windows installer
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          $nsis = @'
+          Unicode True
+          Name "Path of Building"
+          OutFile "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}-setup.exe"
+          InstallDir "$LOCALAPPDATA\Path of Building"
+          RequestExecutionLevel user
+          Page directory
+          Page instfiles
+          Section
+            SetOutPath "$INSTDIR"
+            File /r "package\${{ matrix.id }}\*"
+            CreateShortcut "$DESKTOP\Path of Building.lnk" "$INSTDIR\Path of Building.exe"
+            CreateDirectory "$SMPROGRAMS\Path of Building"
+            CreateShortcut "$SMPROGRAMS\Path of Building\Path of Building.lnk" "$INSTDIR\Path of Building.exe"
+            WriteUninstaller "$INSTDIR\Uninstall.exe"
+          SectionEnd
+          Section "Uninstall"
+            Delete "$DESKTOP\Path of Building.lnk"
+            RMDir /r "$SMPROGRAMS\Path of Building"
+            RMDir /r "$INSTDIR"
+          SectionEnd
+          '@
+          $nsis | Set-Content installer.nsi
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.id }}
+          path: |
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.zip
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  macos:
+    if: needs.metadata.outputs.should_release == 'true'
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-x64
+            runner: macos-15-intel
+            architecture: x86_64
+            triplet: x64-osx-dynamic
+          - id: macos-arm64
+            runner: macos-15
+            architecture: arm64
+            triplet: arm64-osx-dynamic
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out distribution automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: distribution
+      - name: Check out exact upstream release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ inputs.upstream_tag }}
+          path: pob
+      - name: Check out immutable SimpleGraphic runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ needs.metadata.outputs.engine_sha }}
+          path: engine
+          submodules: recursive
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v5.0.3
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ matrix.id }}-${{ needs.metadata.outputs.engine_sha }}
+      - name: Build runtime and application bundle
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+        run: |
+          set -euo pipefail
+          ./engine/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          cmake -S engine -B "build/${{ matrix.id }}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture }}" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/stage/${{ matrix.id }}" \
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" \
+            -DVCPKG_OVERLAY_TRIPLETS="$GITHUB_WORKSPACE/engine/vcpkg-triplets" \
+            -DSIMPLEGRAPHIC_BUILD_TESTS=ON
+          cmake --build "build/${{ matrix.id }}" --parallel
+          ctest --test-dir "build/${{ matrix.id }}" --output-on-failure
+          cmake --install "build/${{ matrix.id }}"
+          python3 engine/scripts/ci/verify_runtime.py --runtime "stage/${{ matrix.id }}" --platform macos
+          python3 distribution/packaging/assemble.py --runtime "stage/${{ matrix.id }}" --source pob --output "package/${{ matrix.id }}" --platform macos
+
+      - name: Optionally sign and notarize application
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERTIFICATE_P12$CERTIFICATE_PASSWORD$APPLE_ID$APPLE_TEAM_ID$APPLE_APP_PASSWORD" ]; then
+            echo "Signing secrets are absent; publishing an unsigned DMG."
+            exit 0
+          fi
+          if [ -z "$CERTIFICATE_P12" ] || [ -z "$CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_ID" ] || [ -z "$APPLE_TEAM_ID" ] || [ -z "$APPLE_APP_PASSWORD" ]; then
+            echo "The macOS signing secret group is incomplete." >&2
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/pathofbuilding.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERTIFICATE_P12" | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychain -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F '"' 'NR == 1 {print $2}')"
+          test -n "$identity"
+          codesign --force --deep --options runtime --timestamp --sign "$identity" "package/${{ matrix.id }}/Path of Building.app"
+
+      - name: Create macOS archives
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent \
+            "package/${{ matrix.id }}/Path of Building.app" \
+            "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.zip"
+          tar -C "package/${{ matrix.id }}" -czf \
+            "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.tar.gz" \
+            "Path of Building.app"
+          hdiutil create -volname "Path of Building" \
+            -srcfolder "package/${{ matrix.id }}/Path of Building.app" \
+            -ov -format UDZO \
+            "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.dmg"
+      - name: Notarize signed DMG
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERTIFICATE_P12" ]; then
+            echo "Skipping notarization for the unsigned DMG."
+            exit 0
+          fi
+          xcrun notarytool submit "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.dmg" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.dmg"
+      - name: Upload macOS release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.id }}
+          path: |
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.tar.gz
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    if: needs.metadata.outputs.should_release == 'true'
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: ubuntu-24.04
+            architecture: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+            appimage_arch: x86_64
+            triplet: x64-linux-dynamic
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+            architecture: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+            appimage_arch: aarch64
+            triplet: arm64-linux-dynamic
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out distribution automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: distribution
+      - name: Check out exact upstream release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ inputs.upstream_tag }}
+          path: pob
+      - name: Check out immutable SimpleGraphic runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ needs.metadata.outputs.engine_sha }}
+          path: engine
+          submodules: recursive
+      - name: Install build and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1-mesa-dev libgl1-mesa-dev libglu1-mesa-dev mesa-common-dev \
+            libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev libx11-dev \
+            pkg-config xorg-dev ninja-build ruby ruby-dev squashfs-tools flatpak flatpak-builder
+          sudo gem install --no-document fpm -v 1.16.0
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v5.0.3
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ matrix.id }}-${{ needs.metadata.outputs.engine_sha }}
+      - name: Build runtime and application
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+        run: |
+          set -euo pipefail
+          ./engine/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          cmake -S engine -B "build/${{ matrix.id }}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/stage/${{ matrix.id }}" \
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" \
+            -DVCPKG_OVERLAY_TRIPLETS="$GITHUB_WORKSPACE/engine/vcpkg-triplets" \
+            -DSIMPLEGRAPHIC_BUILD_TESTS=ON
+          cmake --build "build/${{ matrix.id }}" --parallel
+          ctest --test-dir "build/${{ matrix.id }}" --output-on-failure
+          cmake --install "build/${{ matrix.id }}"
+          python3 engine/scripts/ci/verify_runtime.py --runtime "stage/${{ matrix.id }}" --platform linux
+          python3 distribution/packaging/assemble.py --runtime "stage/${{ matrix.id }}" --source pob --output "package/${{ matrix.id }}" --platform linux
+      - name: Create Linux archives and native packages
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          id="${{ matrix.id }}"
+          tar -C "package/$id" -czf "PathOfBuilding-$version-$id.tar.gz" .
+          mkdir -p pkg/usr/bin pkg/usr/share/applications pkg/opt/pathofbuilding
+          cp -a "package/$id/." pkg/opt/pathofbuilding/
+          ln -s /opt/pathofbuilding/pathofbuilding pkg/usr/bin/pathofbuilding
+          cp distribution/packaging/linux/pathofbuilding.desktop \
+            pkg/usr/share/applications/community.pathofbuilding.PathOfBuilding.desktop
+          fpm -s dir -t deb -n path-of-building -v "$version" \
+            --architecture "${{ matrix.deb_arch }}" --license MIT \
+            --description "Offline build planner for Path of Exile" \
+            --url "https://github.com/$GITHUB_REPOSITORY" \
+            -C pkg . \
+            -p "PathOfBuilding-$version-$id.deb"
+          fpm -s dir -t rpm -n path-of-building -v "$version" \
+            --architecture "${{ matrix.rpm_arch }}" --license MIT \
+            --description "Offline build planner for Path of Exile" \
+            --url "https://github.com/$GITHUB_REPOSITORY" \
+            -C pkg . \
+            -p "PathOfBuilding-$version-$id.rpm"
+      - name: Create AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          id="${{ matrix.id }}"
+          version="${{ needs.metadata.outputs.version }}"
+          mkdir -p AppDir/usr/opt/pathofbuilding AppDir/usr/bin
+          cp -a "package/$id/." AppDir/usr/opt/pathofbuilding/
+          ln -s ../opt/pathofbuilding/pathofbuilding AppDir/usr/bin/pathofbuilding
+          cp distribution/packaging/linux/pathofbuilding.desktop AppDir/community.pathofbuilding.PathOfBuilding.desktop
+          cat > AppDir/AppRun <<'APP_RUN'
+          #!/bin/sh
+          root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          exec "$root/usr/opt/pathofbuilding/pathofbuilding" "$@"
+          APP_RUN
+          chmod +x AppDir/AppRun
+          mksquashfs AppDir app.squashfs -root-owned -noappend -comp zstd
+          gh release download continuous --repo AppImage/type2-runtime \
+            --pattern "runtime-${{ matrix.appimage_arch }}" --output runtime
+          chmod +x runtime
+          cat runtime app.squashfs > "PathOfBuilding-$version-$id.AppImage"
+          chmod +x "PathOfBuilding-$version-$id.AppImage"
+      - name: Create standalone Flatpak bundle
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          id="${{ matrix.id }}"
+          cp -a "package/$id" distribution/packaging/flatpak/payload
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --user --force-clean --repo flatpak-repo flatpak-build \
+            distribution/packaging/flatpak/community.pathofbuilding.PathOfBuilding.yml
+          flatpak build-bundle flatpak-repo \
+            "PathOfBuilding-$version-$id.flatpak" \
+            community.pathofbuilding.PathOfBuilding
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.id }}
+          path: |
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.tar.gz
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.deb
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.rpm
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.AppImage
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-${{ matrix.id }}.flatpak
+          if-no-files-found: error
+          retention-days: 30
+
+  linux-x86:
+    if: needs.metadata.outputs.should_release == 'true'
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out distribution automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: distribution
+      - name: Check out exact upstream release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ inputs.upstream_tag }}
+          path: pob
+      - name: Check out immutable SimpleGraphic runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ needs.metadata.outputs.engine_sha }}
+          path: engine
+          submodules: recursive
+      - name: Build and package in native i386 userspace
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/386 \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e DEBIAN_FRONTEND=noninteractive -e VCPKG_DISABLE_METRICS=1 \
+            debian:12 linux32 bash -lc '
+              set -euo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential ca-certificates cmake curl git ninja-build python3 python3-venv \
+                ruby ruby-dev squashfs-tools pkg-config tar unzip zip \
+                libegl1-mesa-dev libgl1-mesa-dev libglu1-mesa-dev mesa-common-dev \
+                libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev libx11-dev xorg-dev
+              gem install --no-document fpm -v 1.16.0
+              python3 -m venv /opt/cmake
+              /opt/cmake/bin/pip install --no-cache-dir --only-binary=:all: cmake==3.31.1
+              export PATH=/opt/cmake/bin:$PATH
+              git config --global --add safe.directory /src/engine
+              git config --global --add safe.directory /src/engine/vcpkg
+              ./engine/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+              cmake -S engine -B build/linux-x86 -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/src/stage/linux-x86 \
+                -DVCPKG_TARGET_TRIPLET=x86-linux-dynamic \
+                -DVCPKG_OVERLAY_TRIPLETS=/src/engine/vcpkg-triplets \
+                -DSIMPLEGRAPHIC_BUILD_TESTS=ON
+              cmake --build build/linux-x86 --parallel
+              ctest --test-dir build/linux-x86 --output-on-failure
+              cmake --install build/linux-x86
+              python3 engine/scripts/ci/verify_runtime.py --runtime stage/linux-x86 --platform linux
+              python3 distribution/packaging/assemble.py --runtime stage/linux-x86 --source pob --output package/linux-x86 --platform linux
+              version="${{ needs.metadata.outputs.version }}"
+              tar -C package/linux-x86 -czf "PathOfBuilding-$version-linux-x86.tar.gz" .
+              mkdir -p pkg/usr/bin pkg/usr/share/applications pkg/opt/pathofbuilding
+              cp -a package/linux-x86/. pkg/opt/pathofbuilding/
+              ln -s /opt/pathofbuilding/pathofbuilding pkg/usr/bin/pathofbuilding
+              cp distribution/packaging/linux/pathofbuilding.desktop \
+                pkg/usr/share/applications/community.pathofbuilding.PathOfBuilding.desktop
+              fpm -s dir -t deb -n path-of-building -v "$version" --architecture i386 \
+                --license MIT --description "Offline build planner for Path of Exile" -C pkg . \
+                -p "PathOfBuilding-$version-linux-x86.deb"
+              fpm -s dir -t rpm -n path-of-building -v "$version" --architecture i686 \
+                --license MIT --description "Offline build planner for Path of Exile" -C pkg . \
+                -p "PathOfBuilding-$version-linux-x86.rpm"
+              mkdir -p AppDir/usr/opt/pathofbuilding AppDir/usr/bin
+              cp -a package/linux-x86/. AppDir/usr/opt/pathofbuilding/
+              ln -s ../opt/pathofbuilding/pathofbuilding AppDir/usr/bin/pathofbuilding
+              cp distribution/packaging/linux/pathofbuilding.desktop AppDir/community.pathofbuilding.PathOfBuilding.desktop
+              printf "%s\n" "#!/bin/sh" \
+                "root=\"\$(CDPATH= cd -- \"\$(dirname -- \"\$0\")\" && pwd)\"" \
+                "exec \"\$root/usr/opt/pathofbuilding/pathofbuilding\" \"\$@\"" > AppDir/AppRun
+              chmod +x AppDir/AppRun
+              mksquashfs AppDir app.squashfs -root-owned -noappend -comp zstd
+            '
+          gh release download continuous --repo AppImage/type2-runtime \
+            --pattern runtime-i686 --output runtime
+          cat runtime app.squashfs > "PathOfBuilding-${{ needs.metadata.outputs.version }}-linux-x86.AppImage"
+          chmod +x "PathOfBuilding-${{ needs.metadata.outputs.version }}-linux-x86.AppImage"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Upload Linux x86 release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-x86
+          path: |
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-linux-x86.tar.gz
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-linux-x86.deb
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-linux-x86.rpm
+            PathOfBuilding-${{ needs.metadata.outputs.version }}-linux-x86.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: needs.metadata.outputs.should_release == 'true'
+    needs: [metadata, windows, macos, linux, linux-x86]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out distribution automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download all release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Validate assets and generate checksums
+        run: |
+          set -euo pipefail
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -ge 24
+          (cd release-assets && sha256sum * | sort -k2 > SHA256SUMS.txt)
+      - name: Copy exact upstream release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.upstream_tag }}
+        run: |
+          gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${TAG}" --jq '.body' > release-notes.md
+      - name: Publish tag and release atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
+          gh release create "$TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ needs.metadata.outputs.release_name }}" \
+            --notes-file release-notes.md \
+            --verify-tag
+
+  homebrew:
+    if: needs.metadata.outputs.should_release == 'true'
+    needs: [metadata, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out distribution automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Render Homebrew formula
+        run: |
+          python3 packaging/render_channels.py \
+            --assets release-assets \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "${{ inputs.upstream_tag }}" \
+            --version "${{ needs.metadata.outputs.version }}" \
+            --homebrew-template packaging/homebrew/path-of-building.rb.in \
+            --homebrew-output Formula/path-of-building.rb
+      - name: Publish Homebrew tap update
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ] || [ -z "$TAP_REPOSITORY" ]; then
+            echo "Homebrew publication is not configured; see docs/DISTRIBUTION.md."
+            exit 0
+          fi
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPOSITORY}.git" tap
+          mkdir -p tap/Formula
+          cp Formula/path-of-building.rb tap/Formula/path-of-building.rb
+          cd tap
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/path-of-building.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "Update Path of Building to ${{ needs.metadata.outputs.version }}"
+          git push

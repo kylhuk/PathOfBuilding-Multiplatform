@@ -1,0 +1,9 @@
+# cspell:words pathofbuilding
+[Desktop Entry]
+Type=Application
+Name=Path of Building
+Comment=Offline build planner for Path of Exile
+Exec=pathofbuilding
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true
