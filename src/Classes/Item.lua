@@ -1187,9 +1187,6 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 		::continue::
 		l = l + 1
 	end
-	if self.baseName and self.title then
-		self.name = self.title .. ", " .. self.baseName:gsub(" %(.+%)","")
-	end
 	if self.advancedCopy and (self.rarity == "UNIQUE" or self.rarity == "RELIC") then
 		if not uniqueModStatOrder then
 			uniqueModStatOrder = { exact = { }, normalised = { } }
@@ -1413,6 +1410,9 @@ function ItemClass:ParseRaw(raw, rarity, highQuality)
 		self.title = "Foulborn " .. self.title
 	elseif not self.foulborn and hasFoulbornPrefix then
 		self.title = self.title:gsub("[Ff]oulborn ", "")
+	end
+	if self.baseName and self.title then
+		self.name = self.title .. ", " .. self.baseName:gsub(" %(.+%)", "")
 	end
 	if not self.quality then
 		self:NormaliseQuality()
@@ -2112,7 +2112,7 @@ function ItemClass:BuildModListForSlotNum(baseList, slotNum)
 		end
 
 		if self.base.armour.BlockChance then
-			armourData.BlockChance = m_floor((self.base.armour.BlockChance * (1 + calcLocal(modList, "BlockChance", "INC", 0) / 100) + calcLocal(modList, "BlockChance", "BASE", 0)))
+			armourData.BlockChance = m_floor((self.base.armour.BlockChance + calcLocal(modList, "BlockChance", "BASE", 0)) * (1 + calcLocal(modList, "BlockChance", "INC", 0) / 100))
 		end
 		if self.base.armour.MovementPenalty then
 			modList:NewMod("MovementSpeed", "INC", -self.base.armour.MovementPenalty, self.modSource, { type = "Condition", var = "IgnoreMovementPenalties", neg = true })
@@ -2212,6 +2212,9 @@ function ItemClass:BuildModListForSlotNum(baseList, slotNum)
 			if jewelData.clusterJewelSkill and not self.clusterJewel.skills[jewelData.clusterJewelSkill] then
 				jewelData.clusterJewelSkill = nil
 			end
+			-- Set missing crafting fields when using advanced copy
+			self.clusterJewelSkill = self.clusterJewelSkill or jewelData.clusterJewelSkill
+			self.clusterJewelNodeCount = self.clusterJewelNodeCount or jewelData.clusterJewelNodeCount
 			jewelData.clusterJewelValid = jewelData.clusterJewelKeystone 
 				or ((jewelData.clusterJewelSkill or jewelData.clusterJewelSmallsAreNothingness) and jewelData.clusterJewelNodeCount) 
 				or (jewelData.clusterJewelSocketCountOverride and jewelData.clusterJewelNothingnessCount)
