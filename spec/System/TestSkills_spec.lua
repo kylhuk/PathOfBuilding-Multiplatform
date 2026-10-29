@@ -113,7 +113,7 @@ describe("TestSkills", function()
 		assert.is_nil(supports.SupportSacredWisps)
 	end)
 
-	it("keeps forced mana reservations on mana", function()
+	it("keeps Mana-Infused Staff reservation on mana and disables it without mana", function()
 		build.itemsTab:CreateDisplayItemFromRaw("Test Staff\nJudgement Staff")
 		build.itemsTab:AddDisplayItem()
 		build.skillsTab:PasteSocketGroup("Mana-Infused Staff 20/0  1\nArrogance 20/0  1\n")
@@ -132,8 +132,12 @@ describe("TestSkills", function()
 		activeSkill = build.calcsTab.mainEnv.player.mainSkill
 		assert.is_true(activeSkill.skillFlags.disable)
 		assert.are.equals("This skill requires reserving Mana", activeSkill.disableReason)
-		assert.are.equals(0, activeSkill.skillData.ManaReservedBase)
+		assert.is_nil(activeSkill.skillData.ManaReservedBase)
+		assert.is_nil(activeSkill.skillData.ManaReservedPercent)
 		assert.is_nil(activeSkill.skillData.LifeReservedBase)
+		assert.are.equals(0, build.calcsTab.mainEnv.player.reserved_ManaPercent)
+		assert.is_nil(build.calcsTab.mainEnv.player.output.ManaReservedPercent)
+		assert.are.equals(0, #build.calcsTab.mainEnv.player.breakdown.ManaReserved.reservations)
 	end)
 	
 	it("Test Scorching ray applying exposure at max stages", function()
@@ -326,6 +330,36 @@ describe("TestSkills", function()
 		runCallback("OnFrame")
 
 		assert.are.near(singleBrandDPS * 2, build.calcsTab.mainOutput.TotalDot, 10 ^ -9)
+	end)
+
+	it("applies Follow-Through to projectile hits and ailments with a shared cap", function()
+		build.skillsTab:PasteSocketGroup("Ethereal Knives 20/0  1\n")
+		local modText = "Projectiles deal %d%% increased Damage with Hits and Ailments for each remaining Chain%s"
+		for _, case in ipairs({
+			{ suffix = ", up to a maximum of 100%", value = 20, chains = 3, used = 0, copies = 1, expected = 60 },
+			{ suffix = ", up to a maximum of 100%", value = 20, chains = 3, used = 0, copies = 2, expected = 100 },
+			{ suffix = ", up to a maximum of 100%", value = 20, chains = 6, used = 0, copies = 1, expected = 100 },
+			{ suffix = ", up to a maximum of 100%", value = 20, chains = 3, used = 2, copies = 1, expected = 20 },
+			{ suffix = ", up to a maximum of 100%", value = 20, chains = 3, used = 3, copies = 1, expected = 0 },
+			{ suffix = ", up to 100%", value = 20, chains = 3, used = 0, copies = 2, expected = 100 },
+			{ suffix = "", value = 15, chains = 6, used = 0, copies = 2, expected = 180 },
+		}) do
+			local baseMods = "100% chance to Poison on Hit\nSkills Chain +" .. case.chains .. " times\n"
+			build.configTab.input.skillChainCount = case.used
+			build.configTab.input.customMods = baseMods .. case.expected .. "% increased Damage with Hits and Ailments"
+			build.configTab:BuildModList()
+			runCallback("OnFrame")
+			local expectedHit = build.calcsTab.mainOutput.AverageHit
+			local expectedPoison = build.calcsTab.mainOutput.PoisonDPS
+			assert.is_true(expectedHit > 0 and expectedPoison > 0)
+
+			build.configTab.input.customMods = baseMods .. (modText:format(case.value, case.suffix) .. "\n"):rep(case.copies)
+			build.configTab:BuildModList()
+			runCallback("OnFrame")
+			assert.are.equals(case.chains - case.used, build.calcsTab.mainOutput.ChainRemaining)
+			assert.are.near(expectedHit, build.calcsTab.mainOutput.AverageHit, 10 ^ -9)
+			assert.are.near(expectedPoison, build.calcsTab.mainOutput.PoisonDPS, 10 ^ -9)
+		end
 	end)
 
 	it("caps total Brand Recall Cooldown Recovery from multiple Chip Away notables at 40%", function()
@@ -726,5 +760,18 @@ describe("TestSkills", function()
 		local barrage = build.calcsTab.mainEnv.player.mainSkill.supportList[1]
 		assert.are.equals("SupportBarrage", barrage.grantedEffect.id)
 		assert.are.equals(20, barrage.level)
+	end)
+
+	it("does not grant Cruelty to Totem, Trap or Mine skills", function()
+		build.skillsTab:PasteSocketGroup("Cold Snap 20/0  1\nCruelty 20/0  1")
+		runCallback("OnFrame")
+		assert.are.equals(40, build.calcsTab.mainEnv.player.modDB.multipliers["Cruelty"])
+
+		for _, proxySupport in ipairs({ "Spell Totem", "Trap", "Blastchain Mine" }) do
+			newBuild()
+			build.skillsTab:PasteSocketGroup("Cold Snap 20/0  1\nCruelty 20/0  1\n"..proxySupport.." 20/0  1")
+			runCallback("OnFrame")
+			assert.is_nil(build.calcsTab.mainEnv.player.modDB.multipliers["Cruelty"])
+		end
 	end)
 end)
